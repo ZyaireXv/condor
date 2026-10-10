@@ -1,0 +1,142 @@
+name: Build and publish Condor container
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/docker-publish.yml
+      - docker/**
+      - compose.yaml
+      - main.py
+      - config_manager.py
+      - pyproject.toml
+      - uv.lock
+      - condor/**
+      - handlers/**
+      - utils/**
+      - mcp_servers/**
+      - routines/**
+      - agents/**
+      - frontend/**
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/docker-publish.yml
+      - docker/**
+      - compose.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: condor-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set image names
+        id: image
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "name=$image" >> "$GITHUB_OUTPUT"
+          echo "sha-tag=sha-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up emulation for ARM64 builds
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build AMD64 image for startup checks
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: condor:smoke
+          build-args: |
+            SOURCE_URL=https://github.com/${{ github.repository }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha,scope=condor-container
+          cache-to: type=gha,mode=max,scope=condor-container
+
+      - name: Verify dashboard, authentication, persistent state and shutdown
+        run: bash docker/smoke-test.sh condor:smoke
+
+      - name: Validate Compose configuration
+        run: docker compose -f compose.yaml config --quiet
+
+      - name: Build ARM64 image for startup checks
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: condor:arm64-smoke
+          build-args: |
+            SOURCE_URL=https://github.com/${{ github.repository }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha,scope=condor-container
+          cache-to: type=gha,mode=max,scope=condor-container
+
+      - name: Verify ARM64 startup under emulation
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: bash docker/smoke-test.sh condor:arm64-smoke
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish AMD64 and ARM64 images
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        id: publish
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ steps.image.outputs.sha-tag }}
+          build-args: |
+            SOURCE_URL=https://github.com/${{ github.repository }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha,scope=condor-container
+          cache-to: type=gha,mode=max,scope=condor-container
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify published manifest
+        if: steps.publish.outcome == 'success'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE@$DIGEST"
+          echo "### Published Condor container" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Platforms: linux/amd64, linux/arm64" >> "$GITHUB_STEP_SUMMARY"
+          echo "Both architectures passed dashboard, login, persistence and shutdown checks." >> "$GITHUB_STEP_SUMMARY"
